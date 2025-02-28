@@ -1,0 +1,317 @@
+// 1. Definir la paleta de colores para la leyenda
+var paletaNBR = ['#0000ff', '#3d4900', '#88b053', '#5AFF00', '#ffff00', '#ffaa00', '#ff5500', '#874F9E'];
+var paletaNDVI = ['#00FF00', '#FFFF00', '#FF0000'];
+
+// 2. Crear un título para el geoportal
+var titulo = ui.Label({
+  value: 'DIMAPCU (Diagnóstico y Monitoreo de Áreas Potenciales de Cultivos)',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '20px',
+    margin: '0 0 10px 0',
+    padding: '10px 0',
+    textAlign: 'center',
+    backgroundColor: '#285d4d',
+    color: '#E6C785'
+  }
+});
+
+// 3. Cargar las Áreas Naturales Protegidas (ANP) de la base de datos WDPA
+var wdpa = ee.FeatureCollection('WCMC/WDPA/current/polygons');
+
+// 4. Cargar los límites de Jalisco desde la base de datos de GADM
+var estados = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM1_NAME', 'Jalisco'));
+
+// 5. Filtrar las ANP dentro de Jalisco y hacer un recorte con los límites del estado
+var anpJalisco = wdpa.filterBounds(estados.geometry())
+  .map(function(feature) {
+    return feature.intersection(estados.geometry());
+  });
+
+// 6. Definir la región de interés (Jalisco)
+var jalisco = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level1")
+    .filter(ee.Filter.eq("ADM1_NAME", "Jalisco"));
+
+// 7. Fechas antes y después de la temporada de incendios en 2023
+var pre_fire_start = '2023-01-01';
+var pre_fire_end = '2023-03-01';
+var post_fire_start = '2023-05-01';
+var post_fire_end = '2023-05-31';
+
+// 8. Función para calcular el NBR
+function calcNBR(image) {
+    return image.normalizedDifference(['B8', 'B12']).rename('NBR');
+}
+
+// 9. Función para calcular el NDWI
+function calcNDWI(image) {
+    return image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+}
+
+// 10. Función para calcular el NDVI
+function calcNDVI(image) {
+    return image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+}
+
+// 11. Cargar imágenes Sentinel-2 antes y después de los incendios
+var pre_fire = ee.ImageCollection("COPERNICUS/S2")
+    .filterBounds(jalisco)
+    .filterDate(pre_fire_start, pre_fire_end)
+    .median();
+
+var post_fire = ee.ImageCollection("COPERNICUS/S2")
+    .filterBounds(jalisco)
+    .filterDate(post_fire_start, post_fire_end)
+    .median();
+
+// 12. Calcular NBR antes y después
+var nbr_pre = calcNBR(pre_fire);
+var nbr_post = calcNBR(post_fire);
+var ndwi_post = calcNDWI(post_fire);
+
+// 13. Calcular NDVI para después del incendio
+var ndvi_post = calcNDVI(post_fire);
+
+// 14. Calcular diferencia de NBR (dNBR)
+var dnbr = nbr_pre.subtract(nbr_post).rename('dNBR');
+
+// 15. Definir umbrales de severidad de incendios y excluir zonas de agua
+var burnSeverity = dnbr
+  .where(ndwi_post.gt(0), -1)  // Asignar valor -1 a zonas de agua
+  .where(dnbr.lte(-0.251).and(ndwi_post.lte(0)), 0)  // Regeneración aumentada, alta
+  .where(dnbr.gt(-0.251).and(dnbr.lte(-0.101)).and(ndwi_post.lte(0)), 1)  // Regeneración aumentada, baja
+  .where(dnbr.gt(-0.101).and(dnbr.lte(0.099)).and(ndwi_post.lte(0)), 2)  // Sin quemar
+  .where(dnbr.gt(0.099).and(dnbr.lte(0.269)).and(ndwi_post.lte(0)), 3)  // Baja severidad
+  .where(dnbr.gt(0.269).and(dnbr.lte(0.439)).and(ndwi_post.lte(0)), 4)  // Moderada-baja
+  .where(dnbr.gt(0.439).and(dnbr.lte(0.659)).and(ndwi_post.lte(0)), 5)  // Moderada-alta
+  .where(dnbr.gt(0.659).and(ndwi_post.lte(0)), 6);  // Alta severidad
+
+// 16. Excluir cuerpos de agua del NDVI
+var ndvi_filtered = ndvi_post.where(ndwi_post.gt(0), -999);  // Asignar valor -999 a zonas de agua
+
+// 17. Definir parámetros de visualización
+var dnbrVis = {
+  min: -1,
+  max: 6,
+  palette: paletaNBR
+};
+
+var ndviVis = {
+  min: -0.2,
+  max: 0.8,
+  palette: paletaNDVI
+};
+
+// 18. Centrar el mapa en Jalisco
+Map.centerObject(estados, 7);
+
+// 19. Agregar las capas de Jalisco y las ANP al mapa
+Map.addLayer(estados, {color: 'gray'}, 'Jalisco', true);
+
+// 20. Añadir capa de imagen en color real
+var trueColor = post_fire.visualize({bands: ['B4', 'B3', 'B2'], min: 0, max: 3000});
+Map.addLayer(trueColor.clip(jalisco), {}, "Imagen Color Real", true);
+
+// Variables para rastrear el estado de la interfaz
+var capaActual = null;  // Capa actualmente visible
+var indiceActivo = null;  // Índice actualmente activo
+var ultimoIndiceSeleccionado = null;  // El último índice que se seleccionó
+
+// 21. Crear el panel principal con la interfaz izquierda
+var panelPrincipal = ui.Panel({
+  widgets: [
+    titulo,
+    ui.Label({
+      value: 'Selecciona un índice:',
+      style: {
+        fontWeight: 'bold',
+        fontSize: '20px',
+        margin: '0 0 10px 0',
+        padding: '10px 0',
+        textAlign: 'center',
+        backgroundColor: '#285d4d',
+        color: '#E6C785'
+      }
+    })
+  ],
+  style: {
+    position: 'top-left',
+    width: '300px',
+    padding: '10px',
+    backgroundColor: '#285d4d',
+    color: '#E6C785'
+  }
+});
+
+// 22. Función para actualizar la visualización según el último índice seleccionado
+function actualizarVisualizacion() {
+  // Si no hay ningún checkbox seleccionado, eliminar todas las capas
+  if (!ultimoIndiceSeleccionado) {
+    if (capaActual) {
+      Map.layers().remove(capaActual);
+      capaActual = null;
+    }
+    actualizarLeyenda(null);
+    return;
+  }
+  
+  // Mostrar el último índice seleccionado
+  if (ultimoIndiceSeleccionado === 'NBR') {
+    // Eliminar capa anterior si existe
+    if (capaActual) {
+      Map.layers().remove(capaActual);
+    }
+    // Agregar capa NBR
+    capaActual = ui.Map.Layer(burnSeverity.clip(jalisco), dnbrVis, "Severidad del Incendio (NBR)");
+    Map.layers().add(capaActual);
+    actualizarLeyenda('NBR');
+  } else if (ultimoIndiceSeleccionado === 'NDVI') {
+    // Eliminar capa anterior si existe
+    if (capaActual) {
+      Map.layers().remove(capaActual);
+    }
+    // Agregar capa NDVI
+    capaActual = ui.Map.Layer(ndvi_filtered.clip(jalisco), ndviVis, "NDVI (sin cuerpos de agua)");
+    Map.layers().add(capaActual);
+    actualizarLeyenda('NDVI');
+  }
+}
+
+// 23. Crear los checkbox para los índices
+var checkboxNBR = ui.Checkbox({
+  label: 'Severidad del Incendio (NBR)',
+  value: false,
+  onChange: function(checked) {
+    if (checked) {
+      // Guardar este como el último índice seleccionado
+      ultimoIndiceSeleccionado = 'NBR';
+      actualizarVisualizacion();
+    } else {
+      // Si se deselecciona, verificar si el otro sigue seleccionado
+      var checkboxNDVISeleccionado = checkboxNDVI.getValue();
+      if (checkboxNDVISeleccionado) {
+        ultimoIndiceSeleccionado = 'NDVI';
+      } else {
+        ultimoIndiceSeleccionado = null;
+      }
+      actualizarVisualizacion();
+    }
+  },
+  style: {
+    color: '#E6C785',
+    backgroundColor: 'rgba(40, 93, 77, 1)'
+  }
+});
+
+var checkboxNDVI = ui.Checkbox({
+  label: 'NDVI (sin cuerpos de agua)',
+  value: false,
+  onChange: function(checked) {
+    if (checked) {
+      // Guardar este como el último índice seleccionado
+      ultimoIndiceSeleccionado = 'NDVI';
+      actualizarVisualizacion();
+    } else {
+      // Si se deselecciona, verificar si el otro sigue seleccionado
+      var checkboxNBRSeleccionado = checkboxNBR.getValue();
+      if (checkboxNBRSeleccionado) {
+        ultimoIndiceSeleccionado = 'NBR';
+      } else {
+        ultimoIndiceSeleccionado = null;
+      }
+      actualizarVisualizacion();
+    }
+  },
+  style: {
+    color: '#E6C785',
+    backgroundColor: 'rgba(40, 93, 77, 1)'
+  }
+});
+
+// Añadir los controles al panel principal
+panelPrincipal.add(checkboxNBR);
+panelPrincipal.add(checkboxNDVI);
+
+// 24. Función para actualizar la leyenda según el índice seleccionado
+var panelLeyenda = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px',
+    backgroundColor: '#285d4d',
+    border: '1px solid #E6C785'
+  }
+});
+Map.add(panelLeyenda);
+
+function actualizarLeyenda(indice) {
+  // Limpiar la leyenda previa
+  panelLeyenda.clear();
+
+  // Si no hay índice activo, ocultar la leyenda
+  if (!indice) {
+    panelLeyenda.style().set('shown', false);
+    return;
+  }
+
+  // Mostrar el panel de la leyenda
+  panelLeyenda.style().set('shown', true);
+
+  // Crear el título de la leyenda
+  var tituloLeyenda = ui.Label({
+    value: 'Leyenda de ' + (indice === 'NBR' ? 'Severidad (NBR)' : 'NDVI'),
+    style: { fontWeight: 'bold', fontSize: '14px', margin: '0 0 4px 0', color: '#E6C785' }
+  });
+
+  // Definir la paleta y valores correspondientes
+  var paleta = indice === 'NBR' ? paletaNBR : paletaNDVI;
+  var valores = indice === 'NBR' ? [
+    'Agua', 
+    'Regeneración aumentada, alta', 
+    'Regeneración aumentada, baja', 
+    'Sin quemar', 
+    'Baja severidad', 
+    'Moderada-baja', 
+    'Moderada-alta', 
+    'Alta severidad'
+  ] : ['Baja', 'Media', 'Alta'];
+
+  // Crear los elementos de la leyenda
+  var elementosLeyenda = valores.map(function(valor, i) {
+    return ui.Panel([
+      ui.Label({
+        style: { backgroundColor: paleta[i], padding: '5px', margin: '0 5px 0 0' }
+      }),
+      ui.Label(valor, { color: '#E6C785' })
+    ], ui.Panel.Layout.Flow('horizontal'));
+  });
+
+  // Agregar los elementos al panel de leyenda
+  panelLeyenda.add(tituloLeyenda);
+  elementosLeyenda.forEach(function(el) {
+    panelLeyenda.add(el);
+  });
+}
+
+// 25. Añadir el panel principal al UI
+ui.root.insert(0, panelPrincipal);
+
+// 26. Exportar resultados
+Export.image.toDrive({
+    image: burnSeverity.clip(jalisco),
+    description: 'BurnSeverity_Jalisco_2023',
+    scale: 30,
+    region: jalisco.geometry(),
+    fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+    image: ndvi_filtered.clip(jalisco),
+    description: 'NDVI_Jalisco_2023',
+    scale: 30,
+    region: jalisco.geometry(),
+    fileFormat: 'GeoTIFF'
+});
+
+// 27. Agregar la capa de ANP con opacidad y siempre en la parte superior
+Map.addLayer(anpJalisco.style({color: 'green', fillColor: '00000000'}), {}, 'Áreas Naturales Protegidas', true);
